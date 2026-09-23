@@ -1,0 +1,3 @@
+# CuTe JIT for the validated five-tap BF16 temporal feature kernel.
+# ComfyUI supplies PyTorch, safetensors and Comfy Kitchen.
+nvidia-cutlass-dsl[cu13]==4.7.0

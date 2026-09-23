@@ -1,0 +1,276 @@
+"""Execution-owned retained helpers layered on the released VDN math.
+
+This module intentionally subclasses :class:`vdn_h3.branch.LinearBranch` instead of
+turning the reference-math module into a cache owner. The arithmetic remains the
+same; only recurrence banks and grouped-window gather storage are borrowed from the
+execution-local ``RuntimeBuffers`` lease when retention is enabled.
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+# Modified for ComfyUI-VDN-H3-Fast; upstream provenance is in NOTICE.
+from . import branch as B
+from . import window as W
+from .query_positions import (
+    GEOMETRY_SCHEMA,
+    bind_query_map,
+    describe_window_geometry,
+)
+from .runtime import current_runtime_buffers
+
+
+@torch.profiler.record_function('vdn.scans_including_factor')
+def run_scans_runtime(backend, alpha, a_raw, b_raw, text_state=None):
+    """Reference recurrence with execution-local bank reuse when available."""
+    with torch.autocast(device_type=a_raw.device.type, enabled=False):
+        transitions, injections = backend.factor_apply(alpha, a_raw, b_raw)
+        num_frames = transitions.shape[0]
+        start = (
+            torch.zeros_like(injections[0])
+            if text_state is None else text_state.to(injections.dtype)
+        )
+        resources = current_runtime_buffers()
+        if resources is None:
+            prefix = torch.empty(
+                (num_frames, *start.shape), dtype=injections.dtype,
+                device=injections.device)
+            suffix = torch.empty_like(prefix)
+        else:
+            prefix, suffix = resources.scan_banks(
+                num_frames, start.shape, injections.dtype, injections.device)
+
+        state = start
+        for frame in range(num_frames):
+            torch.baddbmm(
+                injections[frame], state, transitions[frame], out=prefix[frame])
+            state = prefix[frame]
+        state = start
+        for frame in range(num_frames - 1, -1, -1):
+            torch.baddbmm(
+                injections[frame], state, transitions[frame], out=suffix[frame])
+            state = suffix[frame]
+        return prefix, suffix
+
+
+class RuntimeLinearBranch(B.LinearBranch):
+    """LinearBranch whose reusable state banks belong to the current VDN execution."""
+
+    def _readout(self, w, xv, qkv_raw, num_frames, tokens_per_frame, bounds,
+                 frame_size, text_x, text_k_raw, text_v_raw):
+        n_heads, head_dim = self.num_heads, self.head_dim
+        backend = self._delta_backend(tokens_per_frame)
+        shape = (num_frames, tokens_per_frame, n_heads, head_dim)
+
+        query, key, value = self._features(
+            w, *qkv_raw, num_frames, frame_size,
+            q_fhsd=self.fuse_epilogue)
+        key_by_frame = key.view(shape).permute(0, 2, 1, 3)
+        value_by_frame = value.view(shape).permute(0, 2, 1, 3)
+        beta = torch.sigmoid(F.linear(xv, w["beta_proj.weight"]))
+        beta = beta.view(
+            num_frames, tokens_per_frame, n_heads).permute(0, 2, 1)
+
+        a, b = B.frame_statistics(
+            key_by_frame, value_by_frame, beta, a_fp32=self.a_fp32)
+        frame_mean = xv.view(num_frames, tokens_per_frame, -1).mean(
+            dim=1, dtype=torch.float32)
+        alpha = B.alpha_gate(
+            frame_mean,
+            w["alpha.down.weight"],
+            w["alpha.up.weight"],
+            w["alpha.dt_bias"],
+            w["alpha.A_log"],
+            n_heads,
+            head_dim,
+        )
+
+        text_state = self._text_state(w, text_x, text_k_raw, text_v_raw)
+        prefix_states, suffix_states = run_scans_runtime(
+            backend, alpha, a, b, text_state=text_state)
+
+        gate = torch.sigmoid(
+            F.linear(xv, w["output_gate.down.weight"])
+            @ w["output_gate.up.weight"].T
+            + w["output_gate.up.bias"]
+        )
+        linear_state = B.gather_linear_state(
+            prefix_states,
+            suffix_states,
+            alpha,
+            bounds,
+            bridge=self.bridge,
+            text_state=text_state,
+            out_dtype=gate.dtype,
+            fuse=self.fuse_epilogue,
+        )
+
+        if query.dim() == 4:
+            query_fhsd = query
+        else:
+            query_fhsd = query.view(shape).permute(0, 2, 1, 3)
+        readout = torch.matmul(
+            query_fhsd, linear_state.transpose(-1, -2))
+        return B.linear_epilogue(
+            readout,
+            w["norm.weight"],
+            gate,
+            w["norm.weight"].new_tensor(1e-6).item(),
+            fuse=self.fuse_epilogue,
+        )
+
+
+def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
+                       bounds, anchor_frames, seq, device):
+    """Materialize row tensors from the same pure geometry exported to provider v4."""
+    geometry = describe_window_geometry(
+        int(video_start),
+        int(video_end),
+        int(num_frames),
+        int(tokens_per_frame),
+        tuple(tuple(int(value) for value in pair) for pair in bounds),
+        str(anchor_frames),
+        int(seq),
+    )
+
+    global_idx = torch.tensor(geometry.global_rows, dtype=torch.long, device=device)
+    groups = []
+    square_aligned = []
+    for group in geometry.groups:
+        q_parts = []
+        for frame in group.query_frames:
+            start = geometry.video_start + frame * geometry.tokens_per_frame
+            q_parts.append(torch.arange(start, start + geometry.tokens_per_frame, device=device))
+        k_parts = []
+        for frame in group.key_frames:
+            start = geometry.video_start + frame * geometry.tokens_per_frame
+            k_parts.append(torch.arange(start, start + geometry.tokens_per_frame, device=device))
+        q_idx = torch.cat(q_parts) if q_parts else torch.empty(0, dtype=torch.long, device=device)
+        win_idx = torch.cat(k_parts) if k_parts else torch.empty(0, dtype=torch.long, device=device)
+        groups.append((q_idx, win_idx))
+        square_aligned.append(group.square_aligned)
+
+    return {
+        "geometry_schema": GEOMETRY_SCHEMA,
+        "geometry": geometry,
+        "plan_digest": geometry.plan_digest,
+        "global_idx": global_idx,
+        "groups": groups,
+        "square_aligned": square_aligned,
+        "anchor_slices": list(geometry.anchor_slices),
+        "max_kv_rows": geometry.max_kv_rows,
+    }
+
+
+@torch.profiler.record_function('vdn.grouped_attention_including_pack')
+def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
+                                   num_frames, tokens_per_frame, bounds, scale,
+                                   anchor_frames="none", transformer_options=None,
+                                   query_position_owner=None, batch_nonlocal=False):
+    """Grouped exact window softmax with execution-owned plan/KV scratch reuse.
+
+    v4 receives VDN-owned query positions in the exact restricted K/V domain used
+    by the gather below. v3 remains a direct rectangular ABI; v2 remains the legacy
+    lazy square-Q compatibility ABI. A present but malformed v4 suppresses v2/v3
+    routing and is handled by v4 dispatch as native for that call.
+    """
+    from .softmax_provider import dispatch, has_v2, has_v3, has_v4, preprocess
+
+    query, key, value = preprocess(
+        transformer_options, query, key, value, query.shape[1])
+
+    def attend(q, k, v, kind, aligned=False, **contract):
+        return dispatch(transformer_options, lambda: W._sdpa(q, k, v, scale, None),
+                        q, k, v, kind=kind, scale=scale,
+                        square_aligned=aligned, **contract)
+    heads, head_dim = query.shape[1], query.shape[2]
+    seq = query.shape[0]
+    resources = current_runtime_buffers()
+    plan_key = (
+        GEOMETRY_SCHEMA,
+        video_start,
+        video_end,
+        num_frames,
+        tokens_per_frame,
+        tuple(map(tuple, bounds)),
+        anchor_frames,
+        seq,
+        str(query.device),
+    )
+    builder = lambda: _build_window_plan(
+        video_start, video_end, num_frames, tokens_per_frame,
+        bounds, anchor_frames, seq, query.device)
+    plan = resources.window_plan(plan_key, builder) if resources is not None else builder()
+
+    out = torch.empty_like(query)
+    global_idx = plan["global_idx"]
+    global_count = global_idx.numel()
+    batch_nonlocal = batch_nonlocal and bool(plan["anchor_slices"])
+    if batch_nonlocal:
+        parts = [query[global_idx]] + [query[start:stop] for start, stop in plan["anchor_slices"]]
+        # Preserve CK's per-query quantization groups across concatenated domains.
+        padded = [F.pad(part, (0, 0, 0, 0, 0, (-part.shape[0]) % 128)) for part in parts]
+        packed = torch.cat(padded)
+        nonlocal_out = attend(packed, key, value, "global")
+        out[global_idx] = nonlocal_out[:global_count]
+        offset = padded[0].shape[0]
+        for (start, stop), part in zip(plan["anchor_slices"], padded[1:]):
+            out[start:stop] = nonlocal_out[offset:offset + stop - start]
+            offset += part.shape[0]
+        del parts, padded, packed, nonlocal_out, part
+    elif global_count:
+        out[global_idx] = attend(query[global_idx], key, value, "global")
+
+    groups = plan["groups"]
+    if groups:
+        if resources is None:
+            shape = (plan["max_kv_rows"], heads, head_dim)
+            k_scratch = torch.empty(shape, device=key.device, dtype=key.dtype)
+            v_scratch = torch.empty(shape, device=value.device, dtype=value.dtype)
+        else:
+            k_scratch, v_scratch = resources.kv_scratch(
+                plan["max_kv_rows"], heads, head_dim, key.device, key.dtype)
+        if global_count:
+            torch.index_select(key, 0, global_idx, out=k_scratch[:global_count])
+            torch.index_select(value, 0, global_idx, out=v_scratch[:global_count])
+        v4 = has_v4(transformer_options)
+        v3 = not v4 and has_v3(transformer_options)
+        v2 = not v4 and not v3 and has_v2(transformer_options)
+        for group_index, (q_idx, win_idx) in enumerate(groups):
+            window_rows = win_idx.numel()
+            domain_rows = global_count + window_rows
+            torch.index_select(
+                key, 0, win_idx,
+                out=k_scratch[global_count:domain_rows])
+            torch.index_select(
+                value, 0, win_idx,
+                out=v_scratch[global_count:domain_rows])
+            q_rows = query.index_select(0, q_idx)
+            contract = {"sink_rows": int(global_count)}
+            if v4:
+                query_position_map = None
+                if isinstance(query_position_owner, str) and query_position_owner:
+                    query_position_map = bind_query_map(
+                        plan["geometry"], group_index, query_position_owner
+                    )
+                contract["query_position_map"] = query_position_map
+            elif v2:
+                domain_idx = torch.cat((global_idx, win_idx)) if global_count else win_idx
+                query_positions = torch.searchsorted(win_idx, q_idx) + global_count
+                contract.update(
+                    square_q=query.index_select(0, domain_idx),
+                    query_positions=query_positions,
+                )
+            out[q_idx] = attend(
+                q_rows,
+                k_scratch[:domain_rows],
+                v_scratch[:domain_rows],
+                "local",
+                plan["square_aligned"][group_index],
+                **contract,
+            )
+
+    for start, stop in (() if batch_nonlocal else plan["anchor_slices"]):
+        out[start:stop] = attend(query[start:stop], key, value, "anchor")
+    return out

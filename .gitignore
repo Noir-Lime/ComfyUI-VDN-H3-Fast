@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.safetensors
+*.mp4
+*.wav
+*.jsonl
+*.log
+*.prof
+*.pt
+*.pth
+*.bin
+.DS_Store
