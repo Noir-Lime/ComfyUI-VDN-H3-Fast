@@ -1,3 +1,5 @@
+> **Moved:** VDN-H3 Fast now lives in [Noir-Lime/h3-rtx5090](https://github.com/Noir-Lime/h3-rtx5090) (`vdn_h3_fast/`), alongside the other H3 optimizations. This repo is kept for existing installs and will not receive updates.
+
 # ComfyUI VDN H3 Fast
 
 A single **MODEL → MODEL** custom node for using the released VDN-H3 8-step stage in an existing native MiniMax-H3 workflow. It combines a fused CuTe temporal feature operation, existing fused linear-branch helpers, and shared global/anchor attention preparation. The local and nonlocal attention calls use the **released Comfy Kitchen dense INT8 backend**; no ComfyUI or Comfy Kitchen source patch or locally rebuilt Kitchen is needed.
